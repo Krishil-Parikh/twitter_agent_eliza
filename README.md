@@ -301,3 +301,120 @@ We welcome contributions! Here's how you can help:
 - Add comments for complex logic
 - Update documentation for changes
 - Add tests for new features
+
+---
+
+## 🐦 Setting Up the Twitter Agent Integration
+
+This section will guide you through setting up the Eliza agent to work with Twitter (X) using a custom character (e.g., Jesus) from scratch.
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/elizaos/eliza.git
+cd eliza
+```
+
+### 2. Install Dependencies
+
+```bash
+pnpm install
+```
+
+### 3. Build All Packages
+
+```bash
+pnpm build
+```
+
+### 4. Set Up Twitter API Credentials
+
+You need a Twitter Developer account and a project/app to get these credentials:
+- API Key
+- API Secret
+- Access Token
+- Access Token Secret
+- Twitter Username
+- (Optional) Twitter Email and Password for scraping
+
+Create a `.env` file in the `agent/` directory (or copy from `.env.example`):
+
+```bash
+cp agent/.env.example agent/.env
+```
+
+Edit `agent/.env` and fill in:
+```
+TWITTER_API_KEY=your_api_key
+TWITTER_API_SECRET=your_api_secret
+TWITTER_ACCESS_TOKEN=your_access_token
+TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
+TWITTER_USERNAME=your_twitter_username
+TWITTER_PASSWORD=your_twitter_password   # (if using scraper)
+TWITTER_EMAIL=your_twitter_email           # (if using scraper)
+TWITTER_USER_ID=your_twitter_user_id       # (needed for polling)
+```
+
+> **Tip:** You can find your Twitter user ID using tools like https://tweeterid.com/
+
+### 5. Configure Your Custom Character
+
+Edit or create your character in `agent/src/character.ts`. Example (Jesus):
+```ts
+export const character = {
+  // ...
+  plugins: [twitterPlugin],
+  // ...
+  knowledge: [
+    { path: "../Knowledge/basic_knowledge.txt", shared: true },
+    // ...
+  ],
+  // ...
+};
+```
+Make sure the knowledge file paths are correct (relative to `agent/src/`).
+
+### 6. Ensure Knowledge Files Exist
+
+Check that all files referenced in `knowledge` exist in `agent/Knowledge/`. If not, add or update them as needed.
+
+### 7. Create the Data Directory
+
+If it doesn't exist, create the directory for the SQLite database:
+```bash
+mkdir -p agent/data
+```
+
+### 8. Build the Twitter Plugin (if developing or editing it)
+
+```bash
+pnpm build -F @elizaos/plugin-twitter
+```
+
+### 9. Start the Agent
+
+```bash
+pnpm start
+```
+
+You should see logs indicating successful Twitter integration and agent startup. If you see errors about missing knowledge files or database, check the paths and create missing directories/files as needed.
+
+### 10. Troubleshooting
+
+- **Cannot find package '@elizaos/plugin-twitter'**: Make sure you ran `pnpm install` and `pnpm build`.
+- **Knowledge file not found**: Check the `knowledge` paths in your character file and ensure the files exist.
+- **SQLite error (CANTOPEN)**: Ensure `agent/data` exists and is writable.
+- **Character input is required**: Make sure you are importing and passing your character object to `AgentRuntime`.
+- **Twitter API errors**: Double-check your credentials in `.env`.
+
+### 11. (Optional) Run the Client UI
+
+In a new terminal:
+```bash
+pnpm start:client
+```
+Then open the provided URL in your browser to interact with your agent.
+
+---
+
+For more details, see the [official documentation](https://elizaos.github.io/eliza/) or join the [Discord community](https://discord.gg/elizaos).

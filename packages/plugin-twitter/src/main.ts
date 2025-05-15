@@ -5,6 +5,12 @@ import dotenv from 'dotenv';
 import { IAgentRuntime } from "@elizaos/core";
 import { TwitterApi } from "twitter-api-v2";
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { character } from "../../../agent/src/character";
+
+// ESM __dirname workaround
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Load environment variables from multiple possible locations
 const envPaths = [
@@ -102,6 +108,7 @@ async function main() {
         // Initialize agent runtime
         elizaLogger.info("Initializing agent runtime...");
         const runtime = new AgentRuntime({
+            character: character,
             token: process.env.TWITTER_USERNAME || "",
             agentId: "123e4567-e89b-12d3-a456-426614174000" as `${string}-${string}-${string}-${string}-${string}`,
             actions: [...twitterPlugin.actions],
