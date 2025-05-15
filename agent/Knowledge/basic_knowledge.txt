@@ -1,0 +1,19 @@
+This is a basic knowledge file for testing the RAG system.
+
+Key Concepts:
+1. The RAG (Retrieval-Augmented Generation) system combines retrieval-based and generation-based approaches.
+2. It uses embeddings to find relevant information from the knowledge base.
+3. The system can process both text and PDF files.
+4. Knowledge files should be placed in the agent/Knowledge directory.
+
+Example Questions and Answers:
+Q: What is RAG?
+A: RAG stands for Retrieval-Augmented Generation, a system that combines retrieval of relevant information with text generation.
+
+Q: How does the knowledge system work?
+A: The system processes knowledge files, creates embeddings, and uses them to find relevant information when answering questions.
+
+Q: Where should knowledge files be placed?
+A: Knowledge files should be placed in the agent/Knowledge directory for the system to process them.
+
+This is a test file to verify that the RAG system is working correctly. The system should be able to retrieve and use this information when answering questions. 
