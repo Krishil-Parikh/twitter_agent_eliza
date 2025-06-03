@@ -34,11 +34,25 @@ export class TwitterIntegration {
     }
 
     private async isTweetProcessed(tweetId: string): Promise<boolean> {
-        return await this.database.isTweetReplied(tweetId);
+        try {
+            const isProcessed = await this.database.isTweetReplied(tweetId);
+            if (isProcessed) {
+                elizaLogger.info(`Tweet ${tweetId} has already been processed`);
+            }
+            return isProcessed;
+        } catch (error) {
+            elizaLogger.error(`Error checking if tweet ${tweetId} was processed:`, error);
+            return false;
+        }
     }
 
     private async markTweetAsProcessed(tweetId: string): Promise<void> {
-        await this.database.markTweetAsReplied(tweetId);
+        try {
+            await this.database.markTweetAsReplied(tweetId);
+            elizaLogger.info(`Marked tweet ${tweetId} as processed`);
+        } catch (error) {
+            elizaLogger.error(`Error marking tweet ${tweetId} as processed:`, error);
+        }
     }
 
     async initialize(): Promise<void> {
@@ -148,17 +162,91 @@ export class TwitterIntegration {
         elizaLogger.info(`Started polling for mentions every ${pollInterval}ms`);
     }
 
+    private async ragSearchWithRetry(query: string, limit: number, maxRetries: number = 3): Promise<Array<{ content: string; metadata: any }>> {
+        let retryCount = 0;
+        let lastError: Error | null = null;
+
+        while (retryCount < maxRetries) {
+            try {
+                elizaLogger.info(`Attempting RAG search (attempt ${retryCount + 1}/${maxRetries}): ${query}`);
+                
+                // Add a timeout to the RAG search
+                const timeoutPromise = new Promise<Array<{ content: string; metadata: any }>>((_, reject) => {
+                    setTimeout(() => reject(new Error('RAG search timeout')), 10000);
+                });
+
+                const results = await Promise.race([
+                    this.runtime.rag.search(query, limit),
+                    timeoutPromise
+                ]) as Array<{ content: string; metadata: any }>;
+
+                elizaLogger.info(`RAG search successful, found ${results.length} results`);
+                return results;
+            } catch (error) {
+                retryCount++;
+                lastError = error;
+                elizaLogger.error(`RAG search failed (attempt ${retryCount}/${maxRetries}):`, error);
+                
+                if (retryCount < maxRetries) {
+                    const backoffTime = Math.min(1000 * Math.pow(2, retryCount), 5000);
+                    elizaLogger.info(`Retrying RAG search in ${backoffTime}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                }
+            }
+        }
+
+        elizaLogger.error('RAG search failed after all retries:', lastError);
+        return []; // Return empty array instead of throwing to allow graceful degradation
+    }
+
+    private async ragStoreWithRetry(data: { id: string; content: string; metadata: any }, maxRetries: number = 3): Promise<void> {
+        let retryCount = 0;
+        let lastError: Error | null = null;
+
+        while (retryCount < maxRetries) {
+            try {
+                elizaLogger.info(`Attempting RAG store (attempt ${retryCount + 1}/${maxRetries}): ${data.id}`);
+                
+                // Add a timeout to the RAG store
+                const timeoutPromise = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('RAG store timeout')), 10000);
+                });
+
+                await Promise.race([
+                    this.runtime.rag.store(data),
+                    timeoutPromise
+                ]);
+
+                elizaLogger.info('RAG store successful');
+                return;
+            } catch (error) {
+                retryCount++;
+                lastError = error;
+                elizaLogger.error(`RAG store failed (attempt ${retryCount}/${maxRetries}):`, error);
+                
+                if (retryCount < maxRetries) {
+                    const backoffTime = Math.min(1000 * Math.pow(2, retryCount), 5000);
+                    elizaLogger.info(`Retrying RAG store in ${backoffTime}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, backoffTime));
+                }
+            }
+        }
+
+        elizaLogger.error('RAG store failed after all retries:', lastError);
+        // Don't throw, just log the error to allow graceful degradation
+    }
+
     private async buildConversationContext(tweet: any, conversationId: string): Promise<string> {
         try {
-            // Get existing conversation history from RAG
+            // Get existing conversation history from RAG with retry
             const historyQuery = `conversation:${conversationId}`;
-            const historyResults = await this.runtime.rag.search(historyQuery, 5); // Get last 5 messages
+            const historyResults = await this.ragSearchWithRetry(historyQuery, 5); // Get last 5 messages
             
             // Add current tweet to history
             const tweetText = `@${tweet.username}: ${tweet.text}`;
             
-            // Store the new message in RAG
-            await this.runtime.rag.store({
+            // Store the new message in RAG with retry
+            await this.ragStoreWithRetry({
                 id: stringToUuid(Date.now().toString()),
                 content: tweetText,
                 metadata: {
@@ -176,8 +264,8 @@ export class TwitterIntegration {
                     const parentTweet = await this.scraper.getTweet(tweet.inReplyToStatusId);
                     if (parentTweet) {
                         const parentText = `@${parentTweet.username}: ${parentTweet.text}`;
-                        // Store parent tweet in RAG if not already stored
-                        await this.runtime.rag.store({
+                        // Store parent tweet in RAG with retry
+                        await this.ragStoreWithRetry({
                             id: stringToUuid(tweet.inReplyToStatusId),
                             content: parentText,
                             metadata: {
@@ -206,28 +294,10 @@ export class TwitterIntegration {
         }
     }
 
-    private async generateImage(prompt: string): Promise<Buffer> {
-        try {
-            const encodedPrompt = encodeURIComponent(prompt);
-            const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=2560&height=2049&nologo=true`;
-            
-            // Fetch the image
-            const response = await fetch(imageUrl);
-            if (!response.ok) {
-                throw new Error(`Failed to fetch image: ${response.statusText}`);
-            }
-            
-            // Convert to buffer
-            const arrayBuffer = await response.arrayBuffer();
-            return Buffer.from(arrayBuffer);
-        } catch (error) {
-            await this.handleError(error, 'image generation');
-            throw error;
-        }
-    }
-
     private async handleImageRequest(tweet: any, prompt: string): Promise<void> {
         try {
+            elizaLogger.info(`Starting image generation for prompt: ${prompt}`);
+            
             // Generate the image
             const imageBuffer = await this.generateImage(prompt);
             
@@ -243,19 +313,6 @@ export class TwitterIntegration {
                 },
                 createdAt: Date.now()
             };
-
-            // Store the image generation in RAG
-            await this.runtime.rag.store({
-                id: memory.id,
-                content: `Generated image: ${prompt}`,
-                metadata: {
-                    conversationId: tweet.conversationId,
-                    timestamp: Date.now(),
-                    type: 'image_generation',
-                    prompt,
-                    tweetId: tweet.id
-                }
-            });
 
             // Create state for the response
             const state: State = {
@@ -278,6 +335,7 @@ export class TwitterIntegration {
                 mediaType: 'image/jpeg'
             }];
 
+            elizaLogger.info('Attempting to post image to Twitter...');
             const result = await this.scraper.sendTweet("Here's the image you requested", tweet.id, mediaData);
             const body = await result.json();
             
@@ -287,24 +345,88 @@ export class TwitterIntegration {
                 throw new Error(`Twitter API error (${error.code}): ${error.message}`);
             }
 
-            // Store the image conversation context in RAG
-            const imageUrl = body.data.create_tweet.tweet_results.result.legacy.entities.media[0].media_url_https;
-            await this.runtime.rag.store({
-                id: stringToUuid(Date.now().toString()),
-                content: `Posted image: ${imageUrl} for prompt: ${prompt}`,
-                metadata: {
-                    conversationId: tweet.conversationId,
-                    timestamp: Date.now(),
-                    type: 'image_post',
-                    prompt,
-                    imageUrl,
-                    tweetId: tweet.id
-                }
-            });
-
             elizaLogger.info(`Successfully generated and shared image for prompt: ${prompt}`);
         } catch (error) {
+            elizaLogger.error('Error in handleImageRequest:', error);
             await this.handleError(error, 'handling image request');
+            throw error;
+        }
+    }
+
+    private async generateImage(prompt: string): Promise<Buffer> {
+        try {
+            if (!prompt || prompt.trim() === '') {
+                throw new Error('Empty prompt provided for image generation');
+            }
+
+            const encodedPrompt = encodeURIComponent(prompt.trim());
+            const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=2560&height=2049&nologo=true`;
+            
+            elizaLogger.info(`Attempting to generate image with URL: ${imageUrl}`);
+            
+            // Fetch the image with timeout and retries
+            const maxRetries = 3;
+            let lastError: Error | null = null;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+
+                    try {
+                        elizaLogger.info(`Fetch attempt ${attempt}/${maxRetries}...`);
+                        const response = await fetch(imageUrl, { 
+                            signal: controller.signal,
+                            headers: {
+                                'Accept': 'image/jpeg,image/png,image/*;q=0.8',
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                            }
+                        });
+                        clearTimeout(timeout);
+
+                        if (!response.ok) {
+                            throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+                        }
+
+                        const contentType = response.headers.get('content-type');
+                        if (!contentType || !contentType.startsWith('image/')) {
+                            throw new Error(`Invalid content type: ${contentType}`);
+                        }
+                        
+                        // Convert to buffer
+                        const arrayBuffer = await response.arrayBuffer();
+                        const buffer = Buffer.from(arrayBuffer);
+
+                        // Verify the buffer is not empty and is a valid image
+                        if (buffer.length === 0) {
+                            throw new Error('Received empty image buffer');
+                        }
+
+                        elizaLogger.info(`Successfully generated image (${buffer.length} bytes)`);
+                        return buffer;
+                    } catch (error) {
+                        clearTimeout(timeout);
+                        if (error.name === 'AbortError') {
+                            throw new Error('Image generation request timed out after 30 seconds');
+                        }
+                        throw error;
+                    }
+                } catch (error) {
+                    lastError = error;
+                    elizaLogger.error(`Attempt ${attempt}/${maxRetries} failed:`, error);
+                    
+                    if (attempt < maxRetries) {
+                        const backoffTime = Math.min(1000 * Math.pow(2, attempt), 5000);
+                        elizaLogger.info(`Retrying in ${backoffTime}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, backoffTime));
+                    }
+                }
+            }
+
+            throw lastError || new Error('Failed to generate image after all retries');
+        } catch (error) {
+            elizaLogger.error('Error in generateImage:', error);
+            await this.handleError(error, 'image generation');
             throw error;
         }
     }
@@ -360,6 +482,16 @@ export class TwitterIntegration {
                 };
             }
 
+            // Get conversation history for better context
+            let conversationContext = '';
+            try {
+                const historyQuery = `conversation:${tweet.conversationId}`;
+                const historyResults = await this.ragSearchWithRetry(historyQuery, 5);
+                conversationContext = historyResults.map(r => r.content).join('\n');
+            } catch (error) {
+                elizaLogger.warn('Failed to get conversation history, proceeding without context:', error);
+            }
+
             // Create state for intent analysis
             const state: State = {
                 bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
@@ -368,21 +500,25 @@ export class TwitterIntegration {
                 postDirections: this.runtime.character.style.post.join(' '),
                 roomId: stringToUuid(tweet.conversationId),
                 actors: this.runtime.character.name,
-                recentMessages: cleanText,
+                recentMessages: `${conversationContext}\n\nCurrent tweet: ${cleanText}`,
                 recentMessagesData: []
             };
 
-            // Analyze intent using local Llama model
+            // Analyze intent using local Llama model with better context
             const intentAnalysis = await generateText({
                 runtime: this.runtime,
                 context: composeContext({
                     state,
-                    template: `Analyze this tweet and determine if it's requesting an image generation or just a reply. Consider:
-1. Are there keywords like "generate", "create", "make", "draw", "image", "picture", "photo", "art", "illustration"?
-2. Is it asking for a modification of a previous image?
-3. Is it a general question or comment that needs a reply?
+                    template: `Analyze this tweet and its conversation context to determine if it's requesting an image generation or just a reply. Consider:
+1. Is the user asking for an image, picture, or visual representation?
+2. Is there context from previous messages suggesting this is part of an image-related conversation?
+3. Is it asking for a modification of a previous image?
+4. Is it a general question or comment that needs a reply?
 
-Tweet: "${cleanText}"
+Conversation context:
+${conversationContext}
+
+Current tweet: "${cleanText}"
 
 You must respond with ONLY a JSON object in this exact format, with no additional text:
 {
@@ -431,23 +567,25 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
             // If it's an image request, generate the prompt using local Llama
             let prompt: string | undefined;
             if (intent.shouldGenerateImage) {
-                if (intent.isImageEditRequest) {
-                    const imageContext = this.imageConversations.get(tweet.conversationId);
-                    if (imageContext) {
-                        prompt = await this.buildImagePrompt(tweet, cleanText, imageContext.lastPrompt);
+                try {
+                    if (intent.isImageEditRequest) {
+                        const imageContext = this.imageConversations.get(tweet.conversationId);
+                        if (imageContext) {
+                            prompt = await this.buildImagePrompt(tweet, cleanText, imageContext.lastPrompt);
+                        }
+                    } else {
+                        prompt = await this.buildImagePrompt(tweet, cleanText);
                     }
-                } else {
-                    prompt = await this.buildImagePrompt(tweet, cleanText);
-                }
 
-                // If prompt generation failed, don't generate image
-                if (!prompt) {
-                    elizaLogger.warn(`Failed to generate appropriate prompt for tweet ${tweet.id}`);
-                    return {
-                        shouldGenerateImage: false,
-                        shouldReply: true,
-                        isImageEditRequest: false
-                    };
+                    // If prompt generation failed, use a basic fallback prompt
+                    if (!prompt) {
+                        elizaLogger.warn(`Failed to generate appropriate prompt for tweet ${tweet.id}, using fallback`);
+                        prompt = `A serene biblical scene depicting ${cleanText}, with soft lighting and peaceful atmosphere, suitable for illustrating biblical truth`;
+                    }
+                } catch (error) {
+                    elizaLogger.error('Error generating prompt:', error);
+                    // Use a basic fallback prompt
+                    prompt = `A serene biblical scene depicting ${cleanText}, with soft lighting and peaceful atmosphere, suitable for illustrating biblical truth`;
                 }
             }
 
@@ -469,9 +607,15 @@ You must respond with ONLY a JSON object in this exact format, with no additiona
 
     private async buildImagePrompt(tweet: any, text: string, previousPrompt?: string): Promise<string | null> {
         try {
-            // Get conversation history from RAG
-            const historyQuery = `conversation:${tweet.conversationId} type:image_generation`;
-            const historyResults = await this.runtime.rag.search(historyQuery, 3); // Get last 3 image generations
+            let historyResults = [];
+            try {
+                // Get conversation history from RAG with retry
+                const historyQuery = `conversation:${tweet.conversationId} type:image_generation`;
+                historyResults = await this.ragSearchWithRetry(historyQuery, 3); // Get last 3 image generations
+            } catch (ragError) {
+                elizaLogger.warn('Failed to get conversation history from RAG:', ragError);
+                // Continue without history
+            }
             
             // Build context for prompt generation
             const promptContext = `As Jesus Christ, generate a biblically appropriate image prompt based on this request: "${text}"
@@ -499,14 +643,37 @@ The prompt should be detailed and specific, but always biblically appropriate.`;
                 recentMessagesData: []
             };
 
-            const promptResult = await generateText({
-                runtime: this.runtime,
-                context: composeContext({
-                    state,
-                    template: promptContext
-                }),
-                modelClass: ModelClass.SMALL
-            });
+            let promptResult: string;
+            try {
+                elizaLogger.info('Attempting to generate prompt with context:', promptContext);
+                // Try to generate prompt using the model
+                promptResult = await generateText({
+                    runtime: this.runtime,
+                    context: composeContext({
+                        state,
+                        template: promptContext
+                    }),
+                    modelClass: ModelClass.SMALL
+                });
+                elizaLogger.info('Successfully generated prompt:', promptResult);
+
+                // Store the generated prompt in RAG with retry
+                await this.ragStoreWithRetry({
+                    id: stringToUuid(Date.now().toString()),
+                    content: promptResult,
+                    metadata: {
+                        conversationId: tweet.conversationId,
+                        timestamp: Date.now(),
+                        type: 'image_generation',
+                        prompt: promptResult,
+                        tweetId: tweet.id
+                    }
+                });
+            } catch (error) {
+                elizaLogger.warn('Failed to generate prompt using model, falling back to basic prompt:', error);
+                // Fallback to a basic prompt if model generation fails
+                promptResult = `A serene biblical scene depicting ${text}, with soft lighting and peaceful atmosphere, suitable for illustrating biblical truth`;
+            }
 
             // Verify the prompt is biblically appropriate
             if (this.isInappropriateContent(promptResult)) {
@@ -515,11 +682,89 @@ The prompt should be detailed and specific, but always biblically appropriate.`;
             }
 
             const finalPrompt = promptResult.trim();
+            if (!finalPrompt) {
+                elizaLogger.warn('Generated empty prompt');
+                return null;
+            }
+
             elizaLogger.info(`Generated image prompt for tweet ${tweet.id}: ${finalPrompt}`);
             return finalPrompt;
         } catch (error) {
             elizaLogger.error('Error building image prompt:', error);
-            return null;
+            // Return a basic fallback prompt if everything else fails
+            return `A peaceful biblical scene with soft lighting and gentle colors, suitable for illustrating biblical truth`;
+        }
+    }
+
+    private async generateResponse(cleanText: string, context: string): Promise<string> {
+        try {
+            const state: State = {
+                bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
+                lore: this.runtime.character.lore.join(' '),
+                messageDirections: this.runtime.character.style.post.join(' '),
+                postDirections: this.runtime.character.style.post.join(' '),
+                roomId: stringToUuid('twitter'),
+                actors: this.runtime.character.name,
+                recentMessages: context,
+                recentMessagesData: []
+            };
+
+            // Generate response using the strict Jesus bot guidelines
+            const response = await generateText({
+                runtime: this.runtime,
+                context: composeContext({
+                    state,
+                    template: `You are speaking on behalf of Jesus Christ, as if He were present on Earth today. You must always reflect His character and speak only in ways that are 100% biblically accurate. Your voice is loving, patient, wise, and rooted in Scripture.
+
+Tweet to respond to: "${cleanText}"
+
+Previous conversation context:
+${context}
+
+You must respond in ONLY ONE of these formats, keeping it under 280 characters:
+
+1. Direct Scripture Quote (with reference):
+   Example: "Blessed are the pure in heart, for they shall see God." (Matthew 5:8)
+
+2. Paraphrased Biblical Truth:
+   Example: "Even now, the Father is waiting to welcome you home."
+
+3. Christlike Question (Rhetorical or Reflective):
+   Example: "What does it profit someone to gain the world but lose their soul?"
+
+4. Modern Parable (Short, Rooted in Truth):
+   Example: "A heart chasing applause is like a well with no water. It looks deep but leaves you dry."
+
+Rules:
+- Every response must be based on the Bible
+- Never fabricate doctrine or give personal opinions
+- Tone must be loving, truthful, gentle but authoritative
+- Never be reactive, mocking, or disrespectful
+- Use modern phrasing only if it clarifies biblical meaning
+- No hashtags or emojis
+- Keep it under 280 characters
+
+Choose the most appropriate format based on the tweet and context.`
+                }),
+                modelClass: ModelClass.LARGE
+            });
+
+            // Clean and validate the response
+            const cleanedResponse = response.trim();
+            if (!cleanedResponse) {
+                throw new Error('Generated empty response');
+            }
+
+            // Verify the response is biblically appropriate
+            if (this.isInappropriateContent(cleanedResponse)) {
+                throw new Error('Generated inappropriate response');
+            }
+
+            return cleanedResponse;
+        } catch (error) {
+            elizaLogger.error('Error generating response:', error);
+            // Return a safe fallback response
+            return '"Come to me, all you who are weary and burdened, and I will give you rest." (Matthew 11:28)';
         }
     }
 
@@ -536,7 +781,7 @@ The prompt should be detailed and specific, but always biblically appropriate.`;
             // Get mentions using searchTweets with a more specific query
             const username = process.env.TWITTER_USERNAME!;
             const searchQuery = `(@${username} OR RT @${username}) -is:retweet`; // Exclude retweets
-            const mentionsGenerator = this.scraper.searchTweets(searchQuery, 5, SearchMode.Latest); // Reduced to 5 tweets
+            const mentionsGenerator = this.scraper.searchTweets(searchQuery, 5, SearchMode.Latest);
             
             // Process each mention
             let mentionsCount = 0;
@@ -566,6 +811,9 @@ The prompt should be detailed and specific, but always biblically appropriate.`;
                     // Analyze tweet intent
                     const intent = await this.analyzeTweetIntent(tweet, cleanText);
 
+                    // Mark tweet as processed BEFORE processing to prevent duplicate replies
+                    await this.markTweetAsProcessed(tweet.id);
+
                     if (intent.shouldGenerateImage) {
                         await this.handleImageRequest(tweet, intent.prompt!);
                     } else if (intent.shouldReply) {
@@ -573,38 +821,13 @@ The prompt should be detailed and specific, but always biblically appropriate.`;
                         const conversationId = tweet.inReplyToStatusId || tweet.id;
                         const context = await this.buildConversationContext(tweet, conversationId);
 
-                        // Generate response
-                        const response = await generateText({
-                            runtime: this.runtime,
-                            context: composeContext({
-                                state: {
-                                    bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
-                                    lore: this.runtime.character.lore.join(' '),
-                                    messageDirections: this.runtime.character.style.post.join(' '),
-                                    postDirections: this.runtime.character.style.post.join(' '),
-                                    roomId: stringToUuid(conversationId),
-                                    actors: this.runtime.character.name,
-                                    recentMessages: context,
-                                    recentMessagesData: []
-                                },
-                                template: `You are Jesus Christ. Respond to this tweet: "${cleanText}" using one of these formats:
-1. A relevant Scripture quote
-2. A paraphrased biblical truth
-3. A Christlike question
-4. A short modern parable
-
-Previous conversation:\n${context}
-Keep it under 280 characters. No hashtags or emojis.`
-                            }),
-                            modelClass: ModelClass.LARGE
-                        });
+                        // Generate response using the new guidelines
+                        const response = await this.generateResponse(cleanText, context);
 
                         // Reply to tweet
                         await this.replyToTweet(tweet.id, response);
                     }
 
-                    // Mark tweet as processed BEFORE any potential errors in the reply process
-                    await this.markTweetAsProcessed(tweet.id);
                     mentionsCount++;
                 } catch (error) {
                     elizaLogger.error(`Error processing tweet ${tweet.id}:`, error);
@@ -774,18 +997,6 @@ Keep it under 280 characters. No hashtags or emojis.`
             let retryCount = 0;
 
             try {
-                // Use the character's topics and style for generating tweets
-                const topics = this.runtime.character.topics;
-                const style = this.runtime.character.style.post;
-                const adjectives = this.runtime.character.adjectives;
-                
-                // Randomly select a topic and style element
-                const randomTopic = topics[Math.floor(Math.random() * topics.length)];
-                const randomStyle = style[Math.floor(Math.random() * style.length)];
-                const randomAdjective = adjectives[Math.floor(Math.random() * adjectives.length)];
-                
-                elizaLogger.info(`Generating tweet about ${randomTopic} in ${randomAdjective} style`);
-                
                 // Create state for the tweet generation
                 const state: State = {
                     bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
@@ -794,29 +1005,84 @@ Keep it under 280 characters. No hashtags or emojis.`
                     postDirections: this.runtime.character.style.post.join(' '),
                     roomId: this.runtime.agentId,
                     actors: this.runtime.character.name,
-                    recentMessages: `Generate a tweet about ${randomTopic}`,
+                    recentMessages: 'Generate a tweet as Jesus Christ including all four formats',
                     recentMessagesData: []
                 };
 
-                // Compose context for tweet generation
-                const context = composeContext({
-                    state,
-                    template: `You are ${this.runtime.character.name}. Generate a tweet that is ${randomAdjective} about ${randomTopic}. The tweet should ${randomStyle}. Keep it under 280 characters. No hashtags or emojis.`
-                });
-
-                // Generate tweet content using Google model
+                // Generate tweet content using strict Jesus guidelines
                 const tweetContent = await generateText({
                     runtime: this.runtime,
-                    context,
+                    context: composeContext({
+                        state,
+                        template: `You are speaking on behalf of Jesus Christ, as if He were present on Earth today. You must always reflect His character and speak only in ways that are 100% biblically accurate. Your voice is loving, patient, wise, and rooted in Scripture.
+
+Generate a single, flowing tweet that naturally incorporates these four elements, keeping it under 280 characters:
+
+1. Start with a relevant Bible verse (with reference)
+2. Add a gentle, encouraging truth
+3. Include a thought-provoking question
+4. End with a modern comparison that ties it all together
+
+Example of good flow:
+"Love your enemies, do good to those who hate you." (Luke 6:27) My child, God's grace abounds for all who seek Him. Do you truly treasure what lasts forever, or fleeting earthly gains? A life focused only on self-gain is like a ship without a sail, adrift and lost.
+
+Rules:
+- Create ONE flowing message, not separate statements
+- Start with the Bible verse to establish the foundation
+- Follow with a gentle truth that builds on the verse
+- Add a question that makes people think
+- End with a modern comparison that ties everything together
+- Every part must be based on the Bible
+- Never fabricate doctrine or give personal opinions
+- Tone must be loving, truthful, gentle but authoritative
+- Never be reactive, mocking, or disrespectful
+- Use modern phrasing only if it clarifies biblical meaning
+- No hashtags or emojis
+- Keep it under 280 characters
+
+Generate a tweet that flows naturally while incorporating all four elements.`
+                    }),
                     modelClass: ModelClass.LARGE
                 });
 
-                elizaLogger.info(`Generated tweet content: ${tweetContent}`);
+                // Clean and validate the tweet content
+                const cleanedContent = tweetContent.trim();
+                if (!cleanedContent) {
+                    throw new Error('Generated empty tweet content');
+                }
+
+                // Verify the content is biblically appropriate
+                if (this.isInappropriateContent(cleanedContent)) {
+                    throw new Error('Generated inappropriate tweet content');
+                }
+
+                // Verify that all four formats are present with more lenient checks
+                const hasScripture = /\([^)]+\)/.test(cleanedContent); // Checks for text in parentheses
+                const hasQuestion = /\?/.test(cleanedContent); // Checks for question mark
+                const hasParable = /\b(like|as|than|similar to)\b/i.test(cleanedContent); // Checks for comparison words
+                const hasParaphrase = cleanedContent.length > 0; // Any content can be considered a paraphrase
+
+                // Log what formats were found
+                elizaLogger.info('Format validation results:', {
+                    hasScripture,
+                    hasQuestion,
+                    hasParable,
+                    hasParaphrase,
+                    content: cleanedContent
+                });
+
+                // Only regenerate if completely missing a format
+                if (!hasScripture || !hasQuestion || !hasParable) {
+                    elizaLogger.warn('Missing required formats, regenerating tweet');
+                    throw new Error('Generated content missing required formats');
+                }
+
+                elizaLogger.info(`Generated tweet content: ${cleanedContent}`);
 
                 // Post the tweet with retry logic
                 while (retryCount < MAX_RETRIES) {
                     try {
-                        await this.postTweet(tweetContent);
+                        await this.postTweet(cleanedContent);
                         elizaLogger.info('Successfully posted tweet');
                         break;
                     } catch (error) {
@@ -836,6 +1102,43 @@ Keep it under 280 characters. No hashtags or emojis.`
 
             } catch (error) {
                 elizaLogger.error('Error in generateAndPostTweet:', error);
+                // If we fail to generate a valid tweet, try one more time with a simpler prompt
+                try {
+                    elizaLogger.info('Attempting to generate tweet with simpler prompt');
+                    const fallbackContent = await generateText({
+                        runtime: this.runtime,
+                        context: composeContext({
+                            state: {
+                                bio: Array.isArray(this.runtime.character.bio) ? this.runtime.character.bio.join(' ') : this.runtime.character.bio,
+                                lore: this.runtime.character.lore.join(' '),
+                                messageDirections: this.runtime.character.style.post.join(' '),
+                                postDirections: this.runtime.character.style.post.join(' '),
+                                roomId: this.runtime.agentId,
+                                actors: this.runtime.character.name,
+                                recentMessages: 'Generate a simple flowing tweet as Jesus Christ',
+                                recentMessagesData: []
+                            },
+                            template: `Generate a flowing tweet as Jesus Christ that includes:
+1. A Bible verse with reference
+2. A gentle truth
+3. A question
+4. A modern comparison
+Make it flow naturally as one message, like this example:
+"Love your enemies, do good to those who hate you." (Luke 6:27) My child, God's grace abounds for all who seek Him. Do you truly treasure what lasts forever, or fleeting earthly gains? A life focused only on self-gain is like a ship without a sail, adrift and lost.
+
+Keep it under 280 characters.`
+                        }),
+                        modelClass: ModelClass.LARGE
+                    });
+
+                    const cleanedFallback = fallbackContent.trim();
+                    if (cleanedFallback && !this.isInappropriateContent(cleanedFallback)) {
+                        await this.postTweet(cleanedFallback);
+                        elizaLogger.info('Successfully posted fallback tweet');
+                    }
+                } catch (fallbackError) {
+                    elizaLogger.error('Failed to generate fallback tweet:', fallbackError);
+                }
                 await this.handleError(error, 'periodic posting');
             } finally {
                 this.isProcessing = false;
